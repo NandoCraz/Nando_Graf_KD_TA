@@ -1,33 +1,17 @@
-"""
-Model GNN Teacher berbasis GraphSAGE — Skripsi
-Diadaptasi dari kode kating (Michael_Modeling_GNN_SHAP.ipynb) dan
-diimplementasikan menggunakan metode GraphSAGE dari folder `graphsage/`.
-
-Memuat graf hasil persiapan_data.py (graf_timur.pt), melatih model GNN
-Teacher dengan arsitektur GraphSAGE, lalu mengevaluasinya.
-
-ARSITEKTUR GraphSAGE (sesuai folder graphsage/):
-- graphsage/aggregators.py  → MeanAggregator : merata-rata embedding tetangga
-  yang disampling → dipadankan dengan SAGEConv(aggr='mean') di PyG
-- graphsage/encoders.py     → Encoder        : concat(h_self, h_neigh) lalu
-  Linear → ReLU (2 lapis), persis perilaku SAGEConv
-- graphsage/model.py        → SupervisedGraphSage : stack 2 Encoder (2-hop),
-  classifier Linear di atas embedding akhir
-
-Implementasi di sini memakai SAGEConv dari PyTorch Geometric yang secara
-matematis identik dengan MeanAggregator + Encoder di atas, namun sudah
-dioptimasi untuk sparse graph dan mendukung heterogeneous graph via to_hetero.
-
-Langkah Knowledge Distillation ke model Student BELUM ada di sini --
-itu bagian yang perlu dikembangkan sendiri sebagai kontribusi skripsi.
-"""
-
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric.transforms as T
 from torch_geometric.nn import SAGEConv, to_hetero
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+)
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -52,36 +36,14 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 class GNN(torch.nn.Module):
-    """
-    Model GraphSAGE Teacher — arsitektur 4-lapis dengan SAGEConv.
-
-    Korespondensi dengan folder graphsage/:
-    - Setiap SAGEConv(aggr='mean') ≡ MeanAggregator + Encoder satu lapis.
-      SAGEConv menghitung:  h = W · concat(h_self, mean(h_tetangga)) + b
-      yang persis sama dengan forward() di encoders.py (concat → weight.mm).
-    - Stack 4 lapis SAGEConv ≡ 4-hop neighborhood aggregation, mirip
-      enc2 yang di-stack di atas enc1 pada graphsage/model.py run_cora().
-    - Dropout antar lapis mencegah overfitting, analog dengan sampling
-      tetangga (num_sample) di MeanAggregator yang juga berfungsi sebagai
-      regularisasi implisit.
-
-    Parameter:
-        hidden_channels : dimensi embedding tiap lapis tersembunyi
-        out_channels    : jumlah kelas output (3: Rendah/Cukup/Tinggi)
-        dropout         : probabilitas dropout antar lapis (default 0.3)
-    """
     def __init__(self, hidden_channels, out_channels, dropout=0.3):
         super().__init__()
-        self.dropout = dropout
+        self.drop = nn.Dropout(p=dropout)
 
-        # Lapis 1 — setara agg1 + enc1 di graphsage/model.py
-        # normalize=True → L2-normalisasi embedding output (menstabilkan training)
         self.conv1 = SAGEConv((-1, -1), hidden_channels, normalize=True)
 
-        # Lapis 2 — setara agg2 + enc2 di graphsage/model.py (2-hop)
         self.conv2 = SAGEConv((-1, -1), hidden_channels, normalize=True)
 
-        # Lapis 3 & 4 — perluasan ke 4-hop untuk graf yang lebih dalam
         self.conv3 = SAGEConv((-1, -1), hidden_channels, normalize=True)
         self.conv4 = SAGEConv((-1, -1), out_channels,    normalize=False)
 
@@ -89,24 +51,24 @@ class GNN(torch.nn.Module):
         # Lapis 1: aggregate tetangga hop-1 → ReLU → Dropout
         x = self.conv1(x, edge_index)
         x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.drop(x)
 
         # Lapis 2: aggregate tetangga hop-2 → ReLU → Dropout
         x = self.conv2(x, edge_index)
         x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.drop(x)
 
         # Lapis 3: aggregate tetangga hop-3 → ReLU → Dropout
         x = self.conv3(x, edge_index)
         x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.drop(x)
 
         # Lapis 4: proyeksi ke ruang kelas (logits), tanpa aktivasi
         x = self.conv4(x, edge_index)
         return x
 
 def latih_model(graf, hidden_channels=64, out_channels=3, dropout=0.3,
-                lr=0.005, weight_decay=5e-4, epochs=500):
+                lr=0.005, weight_decay=5e-4, epochs=200):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     graf = graf.to(device)
@@ -129,6 +91,24 @@ def latih_model(graf, hidden_channels=64, out_channels=3, dropout=0.3,
         return loss.item()
 
     @torch.no_grad()
+    def evaluate_step():
+        model.eval()
+        out_dict = model(graf.x_dict, graf.edge_index_dict)
+        out = out_dict['siswa']
+
+        tr_mask = graf['siswa'].train_mask
+        train_acc = out[tr_mask].argmax(dim=-1).eq(graf['siswa'].y[tr_mask]).sum().item() / tr_mask.sum().item()
+
+        v_mask = graf['siswa'].val_mask
+        val_loss = criterion(out[v_mask], graf['siswa'].y[v_mask]).item()
+        val_acc = out[v_mask].argmax(dim=-1).eq(graf['siswa'].y[v_mask]).sum().item() / v_mask.sum().item()
+
+        te_mask = graf['siswa'].test_mask
+        test_acc = out[te_mask].argmax(dim=-1).eq(graf['siswa'].y[te_mask]).sum().item() / te_mask.sum().item()
+
+        return train_acc, val_loss, val_acc, test_acc
+
+    @torch.no_grad()
     def evaluate(mask):
         model.eval()
         out_dict = model(graf.x_dict, graf.edge_index_dict)
@@ -140,13 +120,14 @@ def latih_model(graf, hidden_channels=64, out_channels=3, dropout=0.3,
         return loss, acc, pred, graf['siswa'].y[mask]
 
     history = {'epoch': [], 'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+    best_val_loss = float('inf')
+    best_model_state = None
+    best_epoch = 0
 
     print(f"Mulai pelatihan di device: {device}\n" + "=" * 40)
     for epoch in range(1, epochs + 1):
         train_loss = train()
-        _, train_acc, _, _ = evaluate(graf['siswa'].train_mask)
-        val_loss, val_acc, _, _ = evaluate(graf['siswa'].val_mask)
-        _, test_acc, _, _ = evaluate(graf['siswa'].test_mask)
+        train_acc, val_loss, val_acc, test_acc = evaluate_step()
 
         history['epoch'].append(epoch)
         history['train_loss'].append(train_loss)
@@ -154,9 +135,19 @@ def latih_model(graf, hidden_channels=64, out_channels=3, dropout=0.3,
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
 
-        if epoch % 10 == 0:
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            best_model_state = copy.deepcopy(model.state_dict())
+
+        if epoch % 10 == 0 or epoch == 1 or epoch == epochs:
             print(f'Epoch: {epoch:03d} | Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | '
                   f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f} | Test Acc: {test_acc:.4f}')
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print("=" * 40)
+        print(f"Model terbaik dimuat dari Epoch {best_epoch:03d} (Val Loss: {best_val_loss:.4f})")
 
     return model, history, evaluate
 
@@ -165,16 +156,38 @@ def evaluasi_akhir(model, graf, evaluate, history):
     nama_kelas = ['Rendah', 'Cukup', 'Tinggi']
 
     test_loss, test_acc, test_pred, test_true = evaluate(graf['siswa'].test_mask)
-    print("=" * 50)
-    print(f"FINAL TEST ACCURACY: {test_acc:.4f}")
-    print("=" * 50)
 
     y_true = test_true.cpu().numpy()
     y_pred = test_pred.cpu().numpy()
 
-    print("\nCLASSIFICATION REPORT")
-    print("=" * 50)
-    print(classification_report(y_true, y_pred, target_names=nama_kelas))
+    # Hitung metrik keseluruhan
+    acc = accuracy_score(y_true, y_pred)
+    prec_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    rec_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+
+    prec_weighted = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    rec_weighted = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    print("\n" + "=" * 55)
+    print("HASIL EVALUASI MODEL GNN TEACHER (DATA TEST)")
+    print("=" * 55)
+    print(f"Loss (Focal Loss)   : {test_loss:.4f}")
+    print(f"Accuracy            : {acc:.4f} ({acc * 100:.2f}%)")
+    print("-" * 55)
+    print(f"Precision (Macro)   : {prec_macro:.4f} ({prec_macro * 100:.2f}%)")
+    print(f"Recall (Macro)      : {rec_macro:.4f} ({rec_macro * 100:.2f}%)")
+    print(f"F1-Score (Macro)    : {f1_macro:.4f} ({f1_macro * 100:.2f}%)")
+    print("-" * 55)
+    print(f"Precision (Weighted): {prec_weighted:.4f} ({prec_weighted * 100:.2f}%)")
+    print(f"Recall (Weighted)   : {rec_weighted:.4f} ({rec_weighted * 100:.2f}%)")
+    print(f"F1-Score (Weighted) : {f1_weighted:.4f} ({f1_weighted * 100:.2f}%)")
+    print("=" * 55)
+
+    print("\nDETAIL PER KELAS (CLASSIFICATION REPORT)")
+    print("=" * 55)
+    print(classification_report(y_true, y_pred, target_names=nama_kelas, digits=4, zero_division=0))
 
     # Kurva loss & akurasi
     sns.set_theme(style="whitegrid")
@@ -198,13 +211,55 @@ def evaluasi_akhir(model, graf, evaluate, history):
     cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=nama_kelas, yticklabels=nama_kelas)
-    plt.title(f'Confusion Matrix (Test)\nAccuracy: {test_acc * 100:.2f}%')
+    plt.title(f'Confusion Matrix (Test)\nAccuracy: {acc * 100:.2f}% | F1-Macro: {f1_macro * 100:.2f}%')
     plt.xlabel('Prediksi'); plt.ylabel('Aktual')
     plt.savefig('confusion_matrix.png', dpi=150)
     plt.close()
 
     print("\nGrafik disimpan: kurva_loss_akurasi.png, confusion_matrix.png")
 
+@torch.no_grad()
+def ekstrak_soft_targets(model, graf, temperature: float = 4.0, simpan_ke: str = "soft_targets_teacher.pt"):
+    model.eval()
+    device = next(model.parameters()).device
+    graf = graf.to(device)
+
+    out_dict = model(graf.x_dict, graf.edge_index_dict)
+    logits = out_dict['siswa'].cpu()
+
+    soft_targets = F.softmax(logits / temperature, dim=1) 
+
+    hard_pred = logits.argmax(dim=-1)
+    y_true    = graf['siswa'].y.cpu()
+
+    payload = {
+        'logits'       : logits,
+        'soft_targets' : soft_targets,
+        'hard_pred'    : hard_pred,
+        'y_true'       : y_true,
+        'temperature'  : temperature,
+        'train_mask'   : graf['siswa'].train_mask.cpu(),
+        'val_mask'     : graf['siswa'].val_mask.cpu(),
+        'test_mask'    : graf['siswa'].test_mask.cpu(),
+    }
+
+    torch.save(payload, simpan_ke)
+
+    nama_kelas = ['Rendah', 'Cukup', 'Tinggi']
+    print("EKSTRAKSI SOFT TARGETS TEACHER — KNOWLEDGE DISTILLATION\n")
+    print(f"Temperature (T)    : {temperature}")
+    print(f"Ukuran Logits      : {list(logits.shape)}  (N_siswa x N_kelas)")
+    print(f"Ukuran Soft Targets: {list(soft_targets.shape)}")
+    print(f"\nContoh 3 baris pertama (node siswa 0–2):")
+    print(f"{'Node':<6} {'y_true':<8} {'hard_pred':<11} {'Logits':^30} {'Soft Targets (T='+str(temperature)+')':^36}\n")
+    for i in range(3):
+        logit_str  = "[" + ", ".join(f"{v:.3f}" for v in logits[i].tolist()) + "]"
+        soft_str   = "[" + ", ".join(f"{v:.4f}" for v in soft_targets[i].tolist()) + "]"
+        print(f"{i:<6} {nama_kelas[y_true[i]]:<8} {nama_kelas[hard_pred[i]]:<11} {logit_str:^30} {soft_str:^36}")
+    print(f"\nSoft Targets disimpan ke: '{simpan_ke}'")
+    print("Siap digunakan sebagai target pelatihan model Student.")
+
+    return payload
 
 if __name__ == "__main__":
     graf = torch.load("graf_timur.pt", weights_only=False)
@@ -212,4 +267,4 @@ if __name__ == "__main__":
     model, history, evaluate = latih_model(graf)
     evaluasi_akhir(model, graf, evaluate, history)
 
-    # --- Selanjutnya (belum ditulis di sini): Knowledge Distillation ke model Student ---
+    soft_data = ekstrak_soft_targets(model, graf, temperature=4.0, simpan_ke="soft_targets_teacher.pt")
